@@ -677,25 +677,237 @@ function notation(b, m, side) {
   }
   return head + action + tail;
 }
-/* 简单电脑：吃子分 + 将军分 + 少量随机 */
-function aiScore(b, m, side) {
-  var nb = cloneBoard(b);
-  var cap = nb[m.ty][m.tx];
-  applyOn(nb, m);
+/* ===== 电脑引擎：带位置表的评估 + Alpha-Beta 搜索 + 静态搜索 =====
+   旧版只看眼前一步吃子，这里换成多步搜索：默认 4 层，残局 5 层，
+   另有节点/时间上限兜底，保证手机上也不会卡死。 */
+var PST = {
+  /* 位置表按红方视角（y=0 为黑方底线，y=9 为红方底线），黑方使用时上下镜像 */
+  R: [
+    [14, 14, 12, 18, 16, 18, 12, 14, 14],
+    [16, 20, 18, 24, 26, 24, 18, 20, 16],
+    [12, 12, 12, 18, 18, 18, 12, 12, 12],
+    [12, 18, 16, 22, 22, 22, 16, 18, 12],
+    [6, 12, 8, 18, 18, 18, 8, 12, 6],
+    [6, 0, 8, 14, 14, 14, 8, 0, 6],
+    [6, 6, 2, 0, 6, 0, 2, 6, 6],
+    [6, 6, 2, 0, 6, 0, 2, 6, 6],
+    [8, 6, 4, 2, 6, 2, 4, 6, 8],
+    [4, 2, 0, 4, 4, 4, 0, 2, 4]
+  ],
+  C: [
+    [6, 4, 0, -10, -12, -10, 0, 4, 6],
+    [2, 2, 0, -4, -14, -4, 0, 2, 2],
+    [2, 2, 0, -10, -8, -10, 0, 2, 2],
+    [0, 0, -2, 8, 10, 8, -2, 0, 0],
+    [0, 0, 0, 12, 14, 12, 0, 0, 0],
+    [6, 10, 8, 16, 18, 16, 8, 10, 6],
+    [6, 12, 8, 16, 18, 16, 8, 12, 6],
+    [6, 0, 4, 12, 14, 12, 4, 0, 6],
+    [4, 0, 6, 14, 14, 14, 6, 0, 4],
+    [4, 0, 4, 12, 14, 12, 4, 0, 4]
+  ],
+  N: [
+    [4, 8, 16, 12, 4, 12, 16, 8, 4],
+    [4, 10, 28, 16, 8, 16, 28, 10, 4],
+    [12, 14, 16, 20, 18, 20, 16, 14, 12],
+    [8, 24, 18, 24, 20, 24, 18, 24, 8],
+    [6, 16, 14, 18, 16, 18, 14, 16, 6],
+    [4, 12, 16, 14, 12, 14, 16, 12, 4],
+    [6, 10, 12, 10, 8, 10, 12, 10, 6],
+    [4, 6, 8, 8, 6, 8, 6, 4, 4],
+    [2, 4, 6, 6, 4, 6, 6, 4, 2],
+    [2, 2, 4, 4, 2, 4, 4, 2, 2]
+  ],
+  P: [
+    [0, 3, 6, 9, 12, 9, 6, 3, 0],
+    [18, 36, 56, 80, 120, 80, 56, 36, 18],
+    [14, 26, 42, 60, 80, 60, 42, 26, 14],
+    [10, 20, 30, 34, 40, 34, 30, 20, 10],
+    [6, 12, 18, 18, 20, 18, 18, 12, 6],
+    [2, 0, 8, 0, 8, 0, 8, 0, 2],
+    [0, 0, -2, 0, 4, 0, -2, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0]
+  ]
+};
+function pstVal(t, x, y, side) {
+  var tab = PST[t];
+  if (!tab) return 0;
+  return side === "r" ? tab[y][x] : tab[9 - y][x];
+}
+/* 静态评估：返回红方视角分数 */
+function evaluateBoard(b) {
   var s = 0;
-  if (cap) s += VALUES[cap.t] * 10;
-  var foe = side === "r" ? "b" : "r";
-  if (isInCheck(nb, foe)) s += 50;
-  if (isInCheck(nb, side)) s -= 5000;
-  var moved = nb[m.ty][m.tx];
-  if (moved && moved.t === "P" && crossedRiver(m.tx, m.ty, side)) s += 30;
-  s += Math.random() * 25;
+  for (var y = 0; y < 10; y++) for (var x = 0; x < 9; x++) {
+    var p = b[y][x];
+    if (!p) continue;
+    var v = VALUES[p.t] + pstVal(p.t, x, y, p.s);
+    s += p.s === "r" ? v : -v;
+  }
   return s;
 }
-function aiChoose(b, side) {
-  var ms = legalMoves(b, side), best = null, bs = -Infinity;
-  ms.forEach(function (m) { var s = aiScore(b, m, side); if (s > bs) { bs = s; best = m; } });
+/* 快速判将：直接从将帅位置反推攻击来源，比全盘扫描快得多 */
+function isKingAttacked(b, side) {
+  var k = findKing(b, side);
+  if (!k) return true;
+  var x = k.x, y = k.y, foe = side === "r" ? "b" : "r", i, q;
+  var dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  for (i = 0; i < 4; i++) {
+    var nx = x + dirs[i][0], ny = y + dirs[i][1], seen = 0;
+    while (inBoard(nx, ny)) {
+      q = b[ny][nx];
+      if (q) {
+        seen++;
+        if (q.s === foe) {
+          if (seen === 1 && (q.t === "R" || q.t === "K")) return true;
+          if (seen === 2 && q.t === "C") return true;
+        }
+        if (seen >= 2) break;
+      }
+      nx += dirs[i][0]; ny += dirs[i][1];
+    }
+  }
+  /* 马的攻击：8 个来源点，逐个查蹩马腿 */
+  var legs = [[1, -2, 1, -1], [-1, -2, -1, -1], [1, 2, 1, 1], [-1, 2, -1, 1],
+              [-2, -1, -1, -1], [-2, 1, -1, 1], [2, -1, 1, -1], [2, 1, 1, 1]];
+  for (i = 0; i < 8; i++) {
+    var sx = x + legs[i][0], sy = y + legs[i][1];
+    if (!inBoard(sx, sy)) continue;
+    q = b[sy][sx];
+    if (q && q.s === foe && q.t === "N" && !b[y + legs[i][3]][x + legs[i][2]]) return true;
+  }
+  /* 兵卒的攻击：正面与过河后的侧面 */
+  var fwdY = side === "r" ? y - 1 : y + 1;
+  if (inBoard(x, fwdY)) { q = b[fwdY][x]; if (q && q.s === foe && q.t === "P") return true; }
+  if (crossedRiver(x, y, foe)) {
+    if (inBoard(x - 1, y)) { q = b[y][x - 1]; if (q && q.s === foe && q.t === "P") return true; }
+    if (inBoard(x + 1, y)) { q = b[y][x + 1]; if (q && q.s === foe && q.t === "P") return true; }
+  }
+  return false;
+}
+function fastLegalMoves(b, side) {
+  var out = [];
+  for (var y = 0; y < 10; y++) for (var x = 0; x < 9; x++) {
+    var p = b[y][x];
+    if (!p || p.s !== side) continue;
+    var ms = pseudoMoves(b, x, y);
+    for (var i = 0; i < ms.length; i++) {
+      var cap = applyOn(b, ms[i]);
+      if (!isKingAttacked(b, side)) out.push(ms[i]);
+      b[ms[i].fy][ms[i].fx] = b[ms[i].ty][ms[i].tx];
+      b[ms[i].ty][ms[i].tx] = cap;
+    }
+  }
+  return out;
+}
+function fastCaptureMoves(b, side) {
+  var out = [];
+  for (var y = 0; y < 10; y++) for (var x = 0; x < 9; x++) {
+    var p = b[y][x];
+    if (!p || p.s !== side) continue;
+    var ms = pseudoMoves(b, x, y);
+    for (var i = 0; i < ms.length; i++) {
+      if (!b[ms[i].ty][ms[i].tx]) continue;
+      var cap = applyOn(b, ms[i]);
+      if (!isKingAttacked(b, side)) out.push(ms[i]);
+      b[ms[i].fy][ms[i].fx] = b[ms[i].ty][ms[i].tx];
+      b[ms[i].ty][ms[i].tx] = cap;
+    }
+  }
+  return out;
+}
+var MATE = 1000000;
+var searchNodes = 0, searchAbort = false, searchDeadline = 0;
+function orderScore(b, m) {
+  var cap = b[m.ty][m.tx];
+  if (!cap) return 0;
+  return 100000 + VALUES[cap.t] * 16 - VALUES[b[m.fy][m.fx].t];
+}
+function sortMoves(b, ms) {
+  ms.sort(function (a, c) { return orderScore(b, c) - orderScore(b, a); });
+}
+function quiescence(b, side, alpha, beta, ply) {
+  var stand = (side === "r" ? 1 : -1) * evaluateBoard(b);
+  if (ply > 8) return stand;
+  if (stand >= beta) return beta;
+  if (stand > alpha) alpha = stand;
+  var ms = fastCaptureMoves(b, side);
+  if (ms.length === 0) {
+    /* 无吃子着法时仍要区分将死/困毙与普通局面 */
+    if (fastLegalMoves(b, side).length === 0) return -MATE + ply;
+    return alpha;
+  }
+  sortMoves(b, ms);
+  var foe = side === "r" ? "b" : "r";
+  for (var i = 0; i < ms.length; i++) {
+    var cap = applyOn(b, ms[i]);
+    var sc = -quiescence(b, foe, -beta, -alpha, ply + 1);
+    b[ms[i].fy][ms[i].fx] = b[ms[i].ty][ms[i].tx];
+    b[ms[i].ty][ms[i].tx] = cap;
+    if (sc >= beta) return beta;
+    if (sc > alpha) alpha = sc;
+  }
+  return alpha;
+}
+function negamax(b, side, depth, alpha, beta, ply) {
+  if ((++searchNodes & 2047) === 0 && (searchNodes > 600000 || Date.now() > searchDeadline)) searchAbort = true;
+  if (searchAbort) return 0;
+  if (depth <= 0) return quiescence(b, side, alpha, beta, ply);
+  var ms = fastLegalMoves(b, side);
+  if (ms.length === 0) return -MATE + ply;
+  sortMoves(b, ms);
+  var foe = side === "r" ? "b" : "r", best = -Infinity;
+  for (var i = 0; i < ms.length; i++) {
+    var cap = applyOn(b, ms[i]);
+    var sc = -negamax(b, foe, depth - 1, -beta, -alpha, ply + 1);
+    b[ms[i].fy][ms[i].fx] = b[ms[i].ty][ms[i].tx];
+    b[ms[i].ty][ms[i].tx] = cap;
+    if (searchAbort) return 0;
+    if (sc > best) best = sc;
+    if (sc > alpha) alpha = sc;
+    if (alpha >= beta) break;
+  }
   return best;
+}
+function searchRoot(b, side, depth, moveOrder) {
+  var ms = moveOrder || fastLegalMoves(b, side);
+  if (ms.length === 0) return null;
+  var foe = side === "r" ? "b" : "r";
+  var scored = [];
+  for (var i = 0; i < ms.length; i++) {
+    var cap = applyOn(b, ms[i]);
+    var sc = -negamax(b, foe, depth - 1, -Infinity, Infinity, 1);
+    b[ms[i].fy][ms[i].fx] = b[ms[i].ty][ms[i].tx];
+    b[ms[i].ty][ms[i].tx] = cap;
+    if (searchAbort) return null; /* 本层未搜完，整层作废，用上一层结果 */
+    scored.push({ m: ms[i], s: sc });
+  }
+  scored.sort(function (a, c) { return c.s - a.s; });
+  return scored;
+}
+function aiChoose(b0, side) {
+  var b = cloneBoard(b0);
+  var ms = fastLegalMoves(b, side);
+  if (ms.length === 0) return null;
+  if (ms.length === 1) return ms[0];
+  var pieces = 0;
+  for (var y = 0; y < 10; y++) for (var x = 0; x < 9; x++) if (b[y][x]) pieces++;
+  var maxDepth = pieces <= 12 ? 5 : 4;
+  searchDeadline = Date.now() + 2500;
+  var best = null, order = null;
+  for (var d = 2; d <= maxDepth; d++) {
+    searchNodes = 0; searchAbort = false;
+    var scored = searchRoot(b, side, d, order);
+    if (!scored) break;
+    best = scored;
+    order = scored.map(function (e) { return e.m; });
+    if (Date.now() > searchDeadline - 300) break;
+  }
+  if (!best) { sortMoves(b, ms); return ms[0]; }
+  /* 最优附近 10 分内随机挑一个，避免每局走得一模一样 */
+  var top = best.filter(function (e) { return e.s >= best[0].s - 10; });
+  return top[Math.floor(Math.random() * top.length)].m;
 }
 /*ENGINE-END*/
 </script>
